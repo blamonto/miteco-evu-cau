@@ -5,13 +5,18 @@ MITECO EVU & CAU Indicator Calculator
 
 Uso:
     python run.py "Madrid"
-    python run.py "Barcelona"
-    python run.py "Sevilla" --output-dir ./resultados
+    python run.py "Somiedo" --urban-nucleus
+    python run.py "Barcelona" --output-dir ./resultados
 
 Calcula automáticamente:
   - EVU (Espacio Verde Urbano) con CLC+ Backbone 2023
   - CAU (Cobertura Arbórea Urbana) con HRL Tree Cover Density
   - Genera: shapefile ZEU, GeoTIFFs, tabla baseline JSON
+
+Para municipios rurales, usa --urban-nucleus para recortar la ZEU
+al núcleo urbano (en vez de usar todo el término municipal).
+Si no se indica, el script auto-detecta municipios rurales (>50 km²
+y <10% suelo urbano) y aplica el recorte automáticamente.
 
 No necesita credenciales — usa WMS abierto de Copernicus/EEA.
 """
@@ -32,6 +37,9 @@ import httpx
 import numpy as np
 from rasterio.crs import CRS
 from rasterio.transform import from_bounds
+
+from shapely.geometry import shape, MultiPolygon
+from shapely.ops import unary_union
 
 from app.indicators.evu import calculate_evu, create_evu_mask
 from app.indicators.cau import calculate_cau
@@ -67,6 +75,94 @@ TCD_REST = (
 CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 CRS_3035 = CRS.from_epsg(3035)
 CRS_4326 = CRS.from_epsg(4326)
+
+# CLC classes considered "urban/artificial" for nucleus extraction
+CLC_URBAN_CLASSES = frozenset({
+    111,  # Continuous urban fabric
+    112,  # Discontinuous urban fabric
+    121,  # Industrial or commercial units
+    122,  # Road and rail networks
+    123,  # Port areas
+    124,  # Airports
+    131,  # Mineral extraction sites
+    132,  # Dump sites
+    133,  # Construction sites
+    141,  # Green urban areas
+    142,  # Sport and leisure facilities
+})
+
+# Auto-detection thresholds for rural municipalities
+RURAL_AREA_THRESHOLD_KM2 = 50  # >50 km² considered potentially rural
+RURAL_URBAN_RATIO_THRESHOLD = 0.10  # <10% urban pixels → rural
+
+
+# ── Urban nucleus extraction ──────────────────────────────────────
+
+
+def extract_urban_nucleus(
+    clc_data: np.ndarray,
+    clc_meta: dict,
+    lau_polygon,
+    buffer_m: float = 200,
+) -> MultiPolygon | None:
+    """Extract urban nucleus polygon from CLC raster within LAU boundary.
+
+    1. Selects pixels with urban CLC classes (111, 112, 121, 141, 142, etc.)
+    2. Vectorises them into polygons
+    3. Buffers each polygon by *buffer_m* metres (to include adjacent green areas)
+    4. Dissolves into a single MultiPolygon
+    5. Clips to the LAU boundary
+
+    Returns None if no urban pixels are found.
+    """
+    from rasterio.features import shapes
+
+    urban_mask = np.isin(clc_data, list(CLC_URBAN_CLASSES)).astype(np.uint8)
+
+    # If no urban pixels, return None
+    if urban_mask.sum() == 0:
+        return None
+
+    # Vectorise urban pixels into polygons
+    urban_polys = []
+    for geom, value in shapes(urban_mask, transform=clc_meta["transform"]):
+        if value == 1:
+            urban_polys.append(shape(geom))
+
+    if not urban_polys:
+        return None
+
+    # Dissolve all urban polygons and buffer
+    dissolved = unary_union(urban_polys).buffer(buffer_m)
+
+    # Clip to LAU boundary so we don't extend beyond the municipality
+    nucleus = dissolved.intersection(lau_polygon)
+
+    if nucleus.is_empty:
+        return None
+
+    # Normalise to MultiPolygon
+    if nucleus.geom_type == "Polygon":
+        nucleus = MultiPolygon([nucleus])
+    elif nucleus.geom_type == "GeometryCollection":
+        polys = [g for g in nucleus.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
+        if not polys:
+            return None
+        nucleus = unary_union(polys)
+        if nucleus.geom_type == "Polygon":
+            nucleus = MultiPolygon([nucleus])
+
+    return nucleus
+
+
+def compute_urban_ratio(clc_data: np.ndarray, nodata: int = 0) -> float:
+    """Compute fraction of valid pixels that are urban classes."""
+    valid = clc_data != nodata
+    total = valid.sum()
+    if total == 0:
+        return 0.0
+    urban = np.isin(clc_data, list(CLC_URBAN_CLASSES)) & valid
+    return float(urban.sum() / total)
 
 
 # ── Step 1: Download LAU boundaries and find municipality ──────────
@@ -423,8 +519,16 @@ def run(
     output_dir: str | None = None,
     clc_file: str | None = None,
     tcd_file: str | None = None,
+    urban_nucleus: bool | None = None,
+    buffer_m: float = 200,
 ):
-    """Run the full EVU + CAU pipeline for a municipality."""
+    """Run the full EVU + CAU pipeline for a municipality.
+
+    Args:
+        urban_nucleus: If True, restrict ZEU to urban nucleus only.
+            If None (default), auto-detect: use nucleus for rural municipalities.
+        buffer_m: Buffer in metres around urban pixels (default 200m).
+    """
     start = time.time()
     print()
     print("=" * 60)
@@ -432,30 +536,96 @@ def run(
     print("=" * 60)
 
     # 1. Find municipality
-    print(f"\n[1/6] Buscando municipio: {municipality_name}")
+    print(f"\n[1/7] Buscando municipio: {municipality_name}")
     gdf, name, lau_code = find_municipality(municipality_name)
     print(f"  -> Encontrado: {name} (LAU: {lau_code})")
 
-    # 2. Compute ZEU area
-    print(f"\n[2/6] Calculando área ZEU...")
+    # 2. Compute full LAU area
+    print(f"\n[2/7] Calculando área término municipal...")
     utm = gdf.estimate_utm_crs()
     gdf_utm = gdf.to_crs(utm)
-    zeu_area_m2 = float(gdf_utm.geometry.area.sum())
-    zeu_area_km2 = zeu_area_m2 / 1e6
-    print(f"  -> Área ZEU: {zeu_area_m2:,.0f} m² ({zeu_area_km2:,.2f} km²)")
+    lau_area_m2 = float(gdf_utm.geometry.area.sum())
+    lau_area_km2 = lau_area_m2 / 1e6
+    print(f"  -> Área total municipio: {lau_area_m2:,.0f} m² ({lau_area_km2:,.2f} km²)")
 
     # Get bbox in EPSG:3035
     gdf_3035 = gdf.to_crs(CRS_3035)
     bbox = tuple(gdf_3035.total_bounds)
-    polygon = gdf_3035.geometry.iloc[0]
+    lau_polygon = gdf_3035.geometry.iloc[0]
 
-    # 3. Fetch and calculate EVU
+    # 3. Fetch CLC raster (needed for both EVU and urban nucleus detection)
     if clc_file:
-        print(f"\n[3/6] Cargando CLC desde fichero local: {clc_file}")
+        print(f"\n[3/7] Cargando CLC desde fichero local: {clc_file}")
         clc_data, clc_meta = load_local_raster(clc_file)
     else:
-        print(f"\n[3/6] Descargando CLC (espacio verde urbano)...")
+        print(f"\n[3/7] Descargando CLC (espacio verde urbano)...")
         clc_data, clc_meta = fetch_clc_wms(bbox)
+
+    # Clip CLC to full LAU first (for urban ratio analysis)
+    clc_clipped_full, clc_transform = clip_raster_to_polygon(
+        clc_data, clc_meta["transform"], clc_meta["crs"],
+        lau_polygon, CRS_3035, nodata=int(clc_meta["nodata"]),
+    )
+
+    # 4. Determine ZEU: full LAU or urban nucleus
+    use_nucleus = urban_nucleus
+    urban_ratio = compute_urban_ratio(clc_clipped_full, nodata=int(clc_meta["nodata"]))
+
+    if use_nucleus is None:
+        # Auto-detect: rural if large area AND low urban ratio
+        is_rural = (lau_area_km2 > RURAL_AREA_THRESHOLD_KM2
+                     and urban_ratio < RURAL_URBAN_RATIO_THRESHOLD)
+        if is_rural:
+            use_nucleus = True
+            print(f"\n  ⚠ Municipio rural detectado ({lau_area_km2:.1f} km², "
+                  f"{urban_ratio*100:.1f}% urbano)")
+            print(f"    → Recortando ZEU al núcleo urbano (buffer {buffer_m}m)")
+        else:
+            use_nucleus = False
+
+    if use_nucleus:
+        print(f"\n[4/7] Extrayendo núcleo urbano de la ZEU...")
+        nucleus = extract_urban_nucleus(
+            clc_clipped_full, {"transform": clc_transform}, lau_polygon,
+            buffer_m=buffer_m,
+        )
+        if nucleus is None or nucleus.is_empty:
+            print("  ⚠ No se encontraron pixels urbanos. Usando LAU completo.")
+            polygon = lau_polygon
+            zeu_area_m2 = lau_area_m2
+            zeu_type = "LAU completo (sin núcleo urbano detectado)"
+        else:
+            polygon = nucleus
+            # Compute nucleus area in UTM
+            import pyproj
+            from shapely.ops import transform as shapely_transform
+            from pyproj import Transformer
+            transformer = Transformer.from_crs(CRS_3035, utm, always_xy=True)
+            nucleus_utm = shapely_transform(transformer.transform, nucleus)
+            zeu_area_m2 = float(nucleus_utm.area)
+            zeu_type = f"Núcleo urbano (buffer {buffer_m}m)"
+            print(f"  -> Núcleo urbano extraído: {zeu_area_m2:,.0f} m² "
+                  f"({zeu_area_m2/1e6:,.2f} km²)")
+            print(f"     ({zeu_area_m2/lau_area_m2*100:.1f}% del término municipal)")
+
+            # Build a GeoDataFrame for the nucleus ZEU (for shapefile export)
+            gdf_3035 = gpd.GeoDataFrame(
+                {"LAU_CODE": [lau_code], "name": [name], "zeu_type": [zeu_type]},
+                geometry=[polygon],
+                crs=CRS_3035,
+            )
+            gdf = gdf_3035.to_crs(gdf.crs)
+    else:
+        print(f"\n[4/7] ZEU = término municipal completo")
+        polygon = lau_polygon
+        zeu_area_m2 = lau_area_m2
+        zeu_type = "LAU completo"
+
+    zeu_area_km2 = zeu_area_m2 / 1e6
+    print(f"  -> Área ZEU: {zeu_area_m2:,.0f} m² ({zeu_area_km2:,.2f} km²)")
+    print(f"     Tipo: {zeu_type}")
+
+    # 5. Clip CLC to ZEU polygon and calculate EVU
     clc_clipped, clc_transform = clip_raster_to_polygon(
         clc_data, clc_meta["transform"], clc_meta["crs"],
         polygon, CRS_3035, nodata=int(clc_meta["nodata"]),
@@ -464,12 +634,12 @@ def run(
     evu_pct = (evu_m2 / zeu_area_m2 * 100) if zeu_area_m2 > 0 else 0
     print(f"  -> EVU: {evu_m2:,.0f} m² ({evu_pct:.2f}% de la ZEU)")
 
-    # 4. Fetch and calculate CAU
+    # 5. Fetch and calculate CAU
     if tcd_file:
-        print(f"\n[4/6] Cargando TCD desde fichero local: {tcd_file}")
+        print(f"\n[5/7] Cargando TCD desde fichero local: {tcd_file}")
         tcd_data, tcd_meta = load_local_raster(tcd_file)
     else:
-        print(f"\n[4/6] Descargando HRL Tree Cover Density (cobertura arbórea)...")
+        print(f"\n[5/7] Descargando HRL Tree Cover Density (cobertura arbórea)...")
         tcd_data, tcd_meta = fetch_tcd_rest(bbox)
     tcd_clipped, tcd_transform = clip_raster_to_polygon(
         tcd_data, tcd_meta["transform"], tcd_meta["crs"],
@@ -479,10 +649,10 @@ def run(
     cau_pct = (cau_m2 / zeu_area_m2 * 100) if zeu_area_m2 > 0 else 0
     print(f"  -> CAU: {cau_m2:,.0f} m² ({cau_pct:.2f}% de la ZEU)")
 
-    # 5. Generate outputs
+    # 6. Generate outputs
     out = output_dir or os.path.join("output", lau_code)
     os.makedirs(out, exist_ok=True)
-    print(f"\n[5/6] Generando ficheros de salida en: {out}/")
+    print(f"\n[6/7] Generando ficheros de salida en: {out}/")
 
     # ZEU shapefile
     shp = write_zeu_shapefile(gdf, out, lau_code)
@@ -504,8 +674,10 @@ def run(
     )
     print(f"  -> CAU cartografía: {os.path.basename(cau_tif)}")
 
-    # 6. Baseline JSON
+    # 7. Baseline JSON
     baseline = build_baseline(lau_code, name, zeu_area_m2, evu_m2, cau_m2)
+    baseline["zeu_type"] = zeu_type
+    baseline["lau_area_m2"] = round(lau_area_m2, 2)
     baseline_path = os.path.join(out, f"baseline_2024_{lau_code}.json")
     with open(baseline_path, "w") as f:
         json.dump(baseline, f, indent=2, ensure_ascii=False)
@@ -513,14 +685,17 @@ def run(
 
     # Summary
     elapsed = time.time() - start
-    print(f"\n[6/6] RESUMEN — Línea Base 2024")
-    print("─" * 45)
+    print(f"\n[7/7] RESUMEN — Línea Base 2024")
+    print("─" * 50)
     print(f"  Municipio:     {name}")
     print(f"  Código LAU:    {lau_code}")
+    print(f"  Tipo ZEU:      {zeu_type}")
+    if use_nucleus:
+        print(f"  Área municipio:{lau_area_m2:>14,.0f} m²")
     print(f"  Área ZEU:      {zeu_area_m2:>14,.0f} m²")
     print(f"  EVU:           {evu_m2:>14,.0f} m²  ({evu_pct:.2f}%)")
     print(f"  CAU:           {cau_m2:>14,.0f} m²  ({cau_pct:.2f}%)")
-    print("─" * 45)
+    print("─" * 50)
     print(f"  Tiempo: {elapsed:.1f}s")
     print(f"  Outputs: {os.path.abspath(out)}/")
     print()
@@ -548,5 +723,35 @@ if __name__ == "__main__":
         "--tcd-file",
         help="Raster GeoTIFF local de HRL Tree Cover Density (en vez de descarga REST)",
     )
+    parser.add_argument(
+        "--urban-nucleus", "-u",
+        action="store_true",
+        default=None,
+        help="Restringir ZEU al núcleo urbano (para municipios rurales)",
+    )
+    parser.add_argument(
+        "--full-lau",
+        action="store_true",
+        help="Usar LAU completo como ZEU (desactivar auto-detección rural)",
+    )
+    parser.add_argument(
+        "--buffer",
+        type=float,
+        default=200,
+        help="Buffer en metros alrededor del núcleo urbano (default: 200)",
+    )
     args = parser.parse_args()
-    run(args.municipio, args.output_dir, args.clc_file, args.tcd_file)
+
+    # Resolve urban nucleus flag
+    nucleus = args.urban_nucleus
+    if args.full_lau:
+        nucleus = False
+
+    run(
+        args.municipio,
+        args.output_dir,
+        args.clc_file,
+        args.tcd_file,
+        urban_nucleus=nucleus,
+        buffer_m=args.buffer,
+    )
