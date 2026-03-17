@@ -3,7 +3,11 @@
 import numpy as np
 import pytest
 
-from app.indicators.evu import PIXEL_AREA_M2, calculate_evu, create_evu_mask
+from app.indicators.evu import (
+    PIXEL_AREA_M2, calculate_evu, create_evu_mask,
+    detect_clc_product, get_green_classes,
+    CLC_GREEN_CLASSES, CLCPLUS_GREEN_CLASSES,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -71,3 +75,35 @@ class TestCreateEVUMask:
         raster = np.array([[141, 142], [111, 0]], dtype=np.uint8)
         mask = create_evu_mask(raster)
         assert mask[1, 1] == 255  # nodata → 255
+
+
+class TestCLCProductDetection:
+    """Test auto-detection of CORINE vs CLC+ Backbone products."""
+
+    def test_detect_corine_classic(self):
+        raster = np.array([[111, 141], [142, 211]], dtype=np.uint8)
+        assert detect_clc_product(raster) == "corine"
+
+    def test_detect_clcplus_backbone(self):
+        raster = np.array([[1, 4], [5, 6]], dtype=np.uint8)
+        assert detect_clc_product(raster) == "clcplus"
+
+    def test_get_green_classes_corine(self):
+        raster = np.array([[111, 141]], dtype=np.uint8)
+        assert get_green_classes(raster) == CLC_GREEN_CLASSES
+
+    def test_get_green_classes_clcplus(self):
+        raster = np.array([[1, 6]], dtype=np.uint8)
+        assert get_green_classes(raster) == CLCPLUS_GREEN_CLASSES
+
+    def test_evu_with_clcplus_backbone(self):
+        """CLC+ Backbone class 6 (permanent herbaceous) should count as green."""
+        raster = np.full((10, 10), 1, dtype=np.uint8)  # all sealed
+        raster[:5, :] = 6  # half is permanent herbaceous
+        green = get_green_classes(raster)
+        result = calculate_evu(raster, green_classes=green)
+        assert result == 50 * PIXEL_AREA_M2
+
+    def test_empty_raster_defaults_corine(self):
+        raster = np.zeros((5, 5), dtype=np.uint8)
+        assert detect_clc_product(raster) == "corine"

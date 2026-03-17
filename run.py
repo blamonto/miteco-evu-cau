@@ -41,7 +41,7 @@ from rasterio.transform import from_bounds
 from shapely.geometry import shape, MultiPolygon
 from shapely.ops import unary_union
 
-from app.indicators.evu import calculate_evu, create_evu_mask
+from app.indicators.evu import calculate_evu, create_evu_mask, detect_clc_product, get_green_classes
 from app.indicators.cau import calculate_cau
 from app.indicators.baseline import build_baseline
 from app.rasters.clip import clip_raster_to_polygon
@@ -76,8 +76,12 @@ CACHE_DIR = os.path.join(os.path.dirname(__file__), ".cache")
 CRS_3035 = CRS.from_epsg(3035)
 CRS_4326 = CRS.from_epsg(4326)
 
+# Catastro INSPIRE Buildings WFS (open, no auth)
+CATASTRO_BU_WFS = "http://ovc.catastro.meh.es/INSPIRE/wfsBU.aspx"
+
 # CLC classes considered "urban/artificial" for nucleus extraction
-CLC_URBAN_CLASSES = frozenset({
+# CORINE classic (44 classes):
+CLC_URBAN_CLASSES_CORINE = frozenset({
     111,  # Continuous urban fabric
     112,  # Discontinuous urban fabric
     121,  # Industrial or commercial units
@@ -90,6 +94,13 @@ CLC_URBAN_CLASSES = frozenset({
     141,  # Green urban areas
     142,  # Sport and leisure facilities
 })
+# CLC+ Backbone (11 classes):
+CLC_URBAN_CLASSES_PLUS = frozenset({
+    1,   # Sealed artificial
+    2,   # Non-sealed artificial
+})
+# Default (will be resolved at runtime)
+CLC_URBAN_CLASSES = CLC_URBAN_CLASSES_CORINE
 
 # Auto-detection thresholds for rural municipalities
 RURAL_AREA_THRESHOLD_KM2 = 50  # >50 km² considered potentially rural
@@ -104,11 +115,12 @@ def extract_urban_nucleus(
     clc_meta: dict,
     lau_polygon,
     buffer_m: float = 200,
+    nodata: int = 0,
 ) -> MultiPolygon | None:
     """Extract urban nucleus polygon from CLC raster within LAU boundary.
 
-    1. Selects pixels with urban CLC classes (111, 112, 121, 141, 142, etc.)
-    2. Vectorises them into polygons
+    1. Auto-detects CLC product (CORINE 44-class or CLC+ Backbone 11-class)
+    2. Selects pixels with urban classes
     3. Buffers each polygon by *buffer_m* metres (to include adjacent green areas)
     4. Dissolves into a single MultiPolygon
     5. Clips to the LAU boundary
@@ -116,8 +128,11 @@ def extract_urban_nucleus(
     Returns None if no urban pixels are found.
     """
     from rasterio.features import shapes
+    from app.indicators.evu import detect_clc_product
 
-    urban_mask = np.isin(clc_data, list(CLC_URBAN_CLASSES)).astype(np.uint8)
+    product = detect_clc_product(clc_data, nodata)
+    urban_classes = CLC_URBAN_CLASSES_PLUS if product == "clcplus" else CLC_URBAN_CLASSES_CORINE
+    urban_mask = np.isin(clc_data, list(urban_classes)).astype(np.uint8)
 
     # If no urban pixels, return None
     if urban_mask.sum() == 0:
@@ -157,12 +172,198 @@ def extract_urban_nucleus(
 
 def compute_urban_ratio(clc_data: np.ndarray, nodata: int = 0) -> float:
     """Compute fraction of valid pixels that are urban classes."""
+    from app.indicators.evu import detect_clc_product
     valid = clc_data != nodata
     total = valid.sum()
     if total == 0:
         return 0.0
-    urban = np.isin(clc_data, list(CLC_URBAN_CLASSES)) & valid
+    product = detect_clc_product(clc_data, nodata)
+    urban_classes = CLC_URBAN_CLASSES_PLUS if product == "clcplus" else CLC_URBAN_CLASSES_CORINE
+    urban = np.isin(clc_data, list(urban_classes)) & valid
     return float(urban.sum() / total)
+
+
+def _normalise_to_multipolygon(geom):
+    """Convert any polygon-ish geometry to a MultiPolygon."""
+    if geom is None or geom.is_empty:
+        return None
+    if geom.geom_type == "Polygon":
+        return MultiPolygon([geom])
+    if geom.geom_type == "MultiPolygon":
+        return geom
+    if geom.geom_type == "GeometryCollection":
+        polys = [g for g in geom.geoms if g.geom_type in ("Polygon", "MultiPolygon")]
+        if not polys:
+            return None
+        result = unary_union(polys)
+        if result.geom_type == "Polygon":
+            return MultiPolygon([result])
+        return result
+    return None
+
+
+# ── Catastro INSPIRE WFS — official building footprints ───────────
+
+
+def fetch_catastro_buildings(
+    bbox_4326: tuple[float, float, float, float],
+    max_queries: int = 20,
+) -> gpd.GeoDataFrame | None:
+    """Fetch building footprints from Spanish Cadastre INSPIRE WFS.
+
+    The WFS has a ~1 km² limit per query, so for large areas we tile
+    the bbox into smaller chunks.
+
+    Args:
+        bbox_4326: (minlon, minlat, maxlon, maxlat) in EPSG:4326
+        max_queries: Cap number of WFS requests to avoid overloading
+
+    Returns:
+        GeoDataFrame with building polygons, or None if no buildings found.
+    """
+    import xml.etree.ElementTree as ET
+
+    minlon, minlat, maxlon, maxlat = bbox_4326
+
+    # Tile into ~0.01° × 0.01° chunks (~1 km² each)
+    step = 0.01
+    tiles = []
+    lat = minlat
+    while lat < maxlat:
+        lon = minlon
+        while lon < maxlon:
+            tiles.append((
+                round(lat, 5),
+                round(lon, 5),
+                round(min(lat + step, maxlat), 5),
+                round(min(lon + step, maxlon), 5),
+            ))
+            lon += step
+        lat += step
+
+    if len(tiles) > max_queries:
+        # Too many tiles — subsample (center + random)
+        log.info("  Municipio muy grande (%d tiles). Muestreando %d tiles...",
+                 len(tiles), max_queries)
+        import random
+        random.seed(42)
+        tiles = random.sample(tiles, max_queries)
+
+    log.info("  Consultando Catastro WFS (%d tiles)...", len(tiles))
+
+    all_polys = []
+    gml_ns = "{http://www.opengis.net/gml/3.2}"
+
+    for i, (lat0, lon0, lat1, lon1) in enumerate(tiles):
+        params = {
+            "service": "WFS",
+            "version": "2.0.0",
+            "request": "GetFeature",
+            "TYPENAMES": "bu:Building",
+            "count": "500",
+            "BBOX": f"{lat0},{lon0},{lat1},{lon1}",
+            "SRSNAME": "EPSG:4326",
+        }
+        try:
+            resp = httpx.get(CATASTRO_BU_WFS, params=params, timeout=30)
+            if resp.status_code != 200 or b"ExceptionReport" in resp.content[:500]:
+                continue
+        except Exception:
+            continue
+
+        # Parse GML to extract building polygons
+        try:
+            root = ET.fromstring(resp.content)
+        except ET.ParseError:
+            continue
+
+        # Find all posList elements (building footprint coordinates)
+        for pos_list_el in root.iter(f"{gml_ns}posList"):
+            try:
+                coords_text = pos_list_el.text.strip()
+                values = [float(v) for v in coords_text.split()]
+                # Coordinates are lat, lon pairs
+                if len(values) >= 6:  # Need at least 3 points
+                    coords = [(values[j + 1], values[j])
+                              for j in range(0, len(values) - 1, 2)]
+                    if len(coords) >= 3:
+                        from shapely.geometry import Polygon as ShapelyPolygon
+                        poly = ShapelyPolygon(coords)
+                        if poly.is_valid and not poly.is_empty:
+                            all_polys.append(poly)
+            except (ValueError, IndexError):
+                continue
+
+    if not all_polys:
+        return None
+
+    log.info("  -> %d footprints de edificios obtenidos del Catastro", len(all_polys))
+    return gpd.GeoDataFrame(geometry=all_polys, crs="EPSG:4326")
+
+
+def extract_urban_nucleus_catastro(
+    bbox_4326: tuple[float, float, float, float],
+    lau_polygon_3035,
+    buffer_m: float = 200,
+    min_cluster_buildings: int = 5,
+) -> MultiPolygon | None:
+    """Extract urban nucleus using official Catastro building footprints.
+
+    1. Downloads building footprints from the Catastro INSPIRE WFS
+    2. Reprojects to EPSG:3035
+    3. Buffers each building by *buffer_m* metres
+    4. Dissolves into clusters
+    5. Filters clusters with < *min_cluster_buildings* (removes farms/isolated)
+    6. Clips to LAU boundary
+
+    Returns None if no significant urban nucleus is found.
+    """
+    from app.rasters.clip import reproject_polygon
+
+    buildings_gdf = fetch_catastro_buildings(bbox_4326)
+    if buildings_gdf is None or buildings_gdf.empty:
+        log.warning("  No se encontraron edificios en el Catastro. "
+                    "Usando fallback CLC.")
+        return None
+
+    # Reproject to EPSG:3035 for metric buffer
+    buildings_3035 = buildings_gdf.to_crs(epsg=3035)
+
+    # Buffer each building and dissolve
+    buffered = buildings_3035.geometry.buffer(buffer_m)
+    dissolved = unary_union(buffered)
+
+    # Split into individual clusters
+    if dissolved.geom_type == "Polygon":
+        clusters = [dissolved]
+    elif dissolved.geom_type == "MultiPolygon":
+        clusters = list(dissolved.geoms)
+    else:
+        return None
+
+    # Filter small clusters (isolated farms/barns)
+    significant_clusters = []
+    for cluster in clusters:
+        # Count buildings in this cluster
+        n_buildings = buildings_3035.geometry.intersects(cluster).sum()
+        if n_buildings >= min_cluster_buildings:
+            significant_clusters.append(cluster)
+
+    if not significant_clusters:
+        log.warning("  No se encontraron núcleos urbanos significativos "
+                    "(mín. %d edificios).", min_cluster_buildings)
+        return None
+
+    log.info("  -> %d núcleos urbanos encontrados (%d edificios total)",
+             len(significant_clusters), len(buildings_3035))
+
+    # Merge significant clusters
+    nucleus = unary_union(significant_clusters)
+
+    # Clip to LAU boundary
+    nucleus = nucleus.intersection(lau_polygon_3035)
+
+    return _normalise_to_multipolygon(nucleus)
 
 
 # ── Step 1: Download LAU boundaries and find municipality ──────────
@@ -521,6 +722,7 @@ def run(
     tcd_file: str | None = None,
     urban_nucleus: bool | None = None,
     buffer_m: float = 200,
+    tcd_threshold: int = 0,
 ):
     """Run the full EVU + CAU pipeline for a municipality.
 
@@ -528,6 +730,7 @@ def run(
         urban_nucleus: If True, restrict ZEU to urban nucleus only.
             If None (default), auto-detect: use nucleus for rural municipalities.
         buffer_m: Buffer in metres around urban pixels (default 200m).
+        tcd_threshold: Min tree cover density % to count (0-100, default 0).
     """
     start = time.time()
     print()
@@ -583,21 +786,45 @@ def run(
         else:
             use_nucleus = False
 
+    nucleus_source = None  # Track which source defined the nucleus
+
     if use_nucleus:
         print(f"\n[4/7] Extrayendo núcleo urbano de la ZEU...")
-        nucleus = extract_urban_nucleus(
-            clc_clipped_full, {"transform": clc_transform}, lau_polygon,
-            buffer_m=buffer_m,
-        )
+        nucleus = None
+
+        # Strategy 1: Catastro INSPIRE WFS (official building footprints)
+        print("  [a] Consultando Catastro INSPIRE (edificios oficiales)...")
+        try:
+            gdf_4326 = gdf.to_crs(CRS_4326)
+            bbox_4326 = tuple(gdf_4326.total_bounds)  # minlon,minlat,maxlon,maxlat
+            nucleus = extract_urban_nucleus_catastro(
+                bbox_4326, lau_polygon, buffer_m=buffer_m,
+            )
+            if nucleus is not None:
+                nucleus_source = "Catastro INSPIRE (edificios oficiales)"
+                print(f"  ✓ Núcleo urbano del Catastro obtenido")
+        except Exception as e:
+            log.warning("  Catastro WFS no disponible: %s", e)
+
+        # Strategy 2: CLC pixel classification (fallback)
+        if nucleus is None:
+            print("  [b] Fallback: extrayendo núcleo de CLC...")
+            nucleus = extract_urban_nucleus(
+                clc_clipped_full, {"transform": clc_transform}, lau_polygon,
+                buffer_m=buffer_m,
+            )
+            if nucleus is not None:
+                nucleus_source = "CLC pixel classification (aproximación)"
+
         if nucleus is None or nucleus.is_empty:
-            print("  ⚠ No se encontraron pixels urbanos. Usando LAU completo.")
+            print("  ⚠ No se encontraron núcleos urbanos. Usando LAU completo.")
             polygon = lau_polygon
             zeu_area_m2 = lau_area_m2
             zeu_type = "LAU completo (sin núcleo urbano detectado)"
+            nucleus_source = "LAU (Eurostat)"
         else:
             polygon = nucleus
             # Compute nucleus area in UTM
-            import pyproj
             from shapely.ops import transform as shapely_transform
             from pyproj import Transformer
             transformer = Transformer.from_crs(CRS_3035, utm, always_xy=True)
@@ -607,6 +834,7 @@ def run(
             print(f"  -> Núcleo urbano extraído: {zeu_area_m2:,.0f} m² "
                   f"({zeu_area_m2/1e6:,.2f} km²)")
             print(f"     ({zeu_area_m2/lau_area_m2*100:.1f}% del término municipal)")
+            print(f"     Fuente: {nucleus_source}")
 
             # Build a GeoDataFrame for the nucleus ZEU (for shapefile export)
             gdf_3035 = gpd.GeoDataFrame(
@@ -620,6 +848,7 @@ def run(
         polygon = lau_polygon
         zeu_area_m2 = lau_area_m2
         zeu_type = "LAU completo"
+        nucleus_source = "LAU (Eurostat)"
 
     zeu_area_km2 = zeu_area_m2 / 1e6
     print(f"  -> Área ZEU: {zeu_area_m2:,.0f} m² ({zeu_area_km2:,.2f} km²)")
@@ -630,7 +859,15 @@ def run(
         clc_data, clc_meta["transform"], clc_meta["crs"],
         polygon, CRS_3035, nodata=int(clc_meta["nodata"]),
     )
-    evu_m2 = calculate_evu(clc_clipped, nodata=int(clc_meta["nodata"]))
+    # Auto-detect CLC product (CORINE 44-class vs CLC+ Backbone 11-class)
+    clc_product = detect_clc_product(clc_clipped, nodata=int(clc_meta["nodata"]))
+    green_classes = get_green_classes(clc_clipped, nodata=int(clc_meta["nodata"]))
+    if clc_product == "clcplus":
+        print(f"  Detectado: CLC+ Backbone (11 clases) → verde = clases {sorted(green_classes)}")
+    else:
+        print(f"  Detectado: CORINE Land Cover (44 clases) → verde = clases {sorted(green_classes)}")
+    evu_m2 = calculate_evu(clc_clipped, nodata=int(clc_meta["nodata"]),
+                           green_classes=green_classes)
     evu_pct = (evu_m2 / zeu_area_m2 * 100) if zeu_area_m2 > 0 else 0
     print(f"  -> EVU: {evu_m2:,.0f} m² ({evu_pct:.2f}% de la ZEU)")
 
@@ -645,9 +882,11 @@ def run(
         tcd_data, tcd_meta["transform"], tcd_meta["crs"],
         polygon, CRS_3035, nodata=int(tcd_meta["nodata"]),
     )
-    cau_m2 = calculate_cau(tcd_clipped, nodata=int(tcd_meta["nodata"]))
+    cau_m2 = calculate_cau(tcd_clipped, nodata=int(tcd_meta["nodata"]),
+                           min_density=tcd_threshold)
     cau_pct = (cau_m2 / zeu_area_m2 * 100) if zeu_area_m2 > 0 else 0
-    print(f"  -> CAU: {cau_m2:,.0f} m² ({cau_pct:.2f}% de la ZEU)")
+    tcd_note = f" (umbral ≥{tcd_threshold}%)" if tcd_threshold > 0 else ""
+    print(f"  -> CAU: {cau_m2:,.0f} m² ({cau_pct:.2f}% de la ZEU){tcd_note}")
 
     # 6. Generate outputs
     out = output_dir or os.path.join("output", lau_code)
@@ -674,10 +913,31 @@ def run(
     )
     print(f"  -> CAU cartografía: {os.path.basename(cau_tif)}")
 
-    # 7. Baseline JSON
+    # 7. Baseline JSON with data source metadata
     baseline = build_baseline(lau_code, name, zeu_area_m2, evu_m2, cau_m2)
     baseline["zeu_type"] = zeu_type
     baseline["lau_area_m2"] = round(lau_area_m2, 2)
+    if tcd_threshold > 0:
+        baseline["tcd_threshold_pct"] = tcd_threshold
+
+    # Data sources & confidence report
+    clc_source = "local file" if clc_file else "WMS (CLC 2018)"
+    if not clc_file and "simulados" in str(clc_meta.get("_source", "")):
+        clc_source = "SIMULATED (demo data)"
+    tcd_source = "local file" if tcd_file else "EEA REST (HRL TCD 2018)"
+
+    baseline["data_sources"] = {
+        "zeu_boundary": nucleus_source or "LAU (Eurostat)",
+        "evu_raster": clc_source,
+        "cau_raster": tcd_source,
+    }
+    baseline["confidence"] = {
+        "zeu": "alta" if nucleus_source and "Catastro" in nucleus_source else
+               "media" if nucleus_source and "CLC" in (nucleus_source or "") else "alta",
+        "evu": "alta" if clc_file else "baja (datos simulados)",
+        "cau": "alta" if tcd_file else "alta (datos reales EEA)",
+    }
+
     baseline_path = os.path.join(out, f"baseline_2024_{lau_code}.json")
     with open(baseline_path, "w") as f:
         json.dump(baseline, f, indent=2, ensure_ascii=False)
@@ -686,7 +946,7 @@ def run(
     # Summary
     elapsed = time.time() - start
     print(f"\n[7/7] RESUMEN — Línea Base 2024")
-    print("─" * 50)
+    print("─" * 55)
     print(f"  Municipio:     {name}")
     print(f"  Código LAU:    {lau_code}")
     print(f"  Tipo ZEU:      {zeu_type}")
@@ -695,7 +955,13 @@ def run(
     print(f"  Área ZEU:      {zeu_area_m2:>14,.0f} m²")
     print(f"  EVU:           {evu_m2:>14,.0f} m²  ({evu_pct:.2f}%)")
     print(f"  CAU:           {cau_m2:>14,.0f} m²  ({cau_pct:.2f}%)")
-    print("─" * 50)
+    if tcd_threshold > 0:
+        print(f"  TCD umbral:    ≥{tcd_threshold}%")
+    print("─" * 55)
+    print("  FIABILIDAD:")
+    for k, v in baseline["confidence"].items():
+        print(f"    {k.upper():12s} {v}")
+    print("─" * 55)
     print(f"  Tiempo: {elapsed:.1f}s")
     print(f"  Outputs: {os.path.abspath(out)}/")
     print()
@@ -740,6 +1006,12 @@ if __name__ == "__main__":
         default=200,
         help="Buffer en metros alrededor del núcleo urbano (default: 200)",
     )
+    parser.add_argument(
+        "--tcd-threshold",
+        type=int,
+        default=0,
+        help="Densidad mínima de cobertura arbórea %% para contar (0-100, default: 0)",
+    )
     args = parser.parse_args()
 
     # Resolve urban nucleus flag
@@ -754,4 +1026,5 @@ if __name__ == "__main__":
         args.tcd_file,
         urban_nucleus=nucleus,
         buffer_m=args.buffer,
+        tcd_threshold=args.tcd_threshold,
     )

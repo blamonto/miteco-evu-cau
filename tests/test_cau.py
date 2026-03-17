@@ -42,3 +42,17 @@ class TestCalculateCAU:
         # 100→100m², skip nodata, 0→0m², 60→60m²  total = 160 m²
         expected = (1.0 + 0.0 + 0.6) * PIXEL_AREA_M2
         assert calculate_cau(raster) == pytest.approx(expected)
+
+    def test_min_density_threshold(self):
+        """With threshold=10, pixels below 10% are excluded."""
+        raster = np.array([[5, 15], [30, 2]], dtype=np.uint8)
+        # Without threshold: (5+15+30+2)/100 * 100 = 52.0
+        assert calculate_cau(raster, min_density=0) == pytest.approx(52.0)
+        # With threshold=10: only 15 and 30 count → (15+30)/100 * 100 = 45.0
+        assert calculate_cau(raster, min_density=10) == pytest.approx(45.0)
+
+    def test_min_density_threshold_100(self):
+        """Threshold=100 only counts pixels with exactly 100% density."""
+        raster = np.array([[99, 100], [50, 100]], dtype=np.uint8)
+        result = calculate_cau(raster, min_density=100)
+        assert result == pytest.approx(2 * PIXEL_AREA_M2)
